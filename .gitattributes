@@ -1,0 +1,46 @@
+# Set default behavior to automatically normalize line endings
+* text=auto
+
+# Force LF line endings for text files
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+
+# Force CRLF line endings for Windows batch files
+*.bat text eol=crlf
+
+# Binary files
+*.pt binary
+*.npz binary
+*.pkl binary
+*.pickle binary
+*.qu binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.mp4 binary
+*.avi binary
+*.mov binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+
+# Python bytecode
+*.pyc binary
+*.pyo binary
+*.pyd binary
+
+# Jupyter notebook
+*.ipynb text
+
+# Git LFS (if used)
+# *.pt filter=lfs diff=lfs merge=lfs -text
+# *.npz filter=lfs diff=lfs merge=lfs -text
