@@ -465,7 +465,7 @@ def get_XYZU_paper(N: int) -> Tuple[qt.Qobj, qt.Qobj, qt.Qobj, qt.Qobj]:
     if os.path.isfile(U_path + ".qu"):
         U = qt.qload(U_path)
     else:
-        U = 2*qt.qeye(N) - (X**2 + Z**2 + Y**2)/3
+        U = 2*qt.qeye(N) - (X**2 + (X.dag())**2 + Z**2 + (Z.dag())**2 + Y**2 + (Y.dag())**2)/6
         qt.qsave(U, U_path)
 
     return X, Y, Z, U
