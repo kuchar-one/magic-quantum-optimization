@@ -77,6 +77,12 @@ def main() -> int:
         choices=["nsga2", "nsga3", "moead", "age", "age2", "rvea", "smsemoa", "ctaea", "unsga3", "rnsga2", "rnsga3"],
         help="Optimization algorithm to use (default: nsga2)",
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: auto-detect as half of CPU cores)",
+    )
     args = parser.parse_args()
 
     # Parse target_superposition tokens into complex coefficients
@@ -142,6 +148,7 @@ def main() -> int:
                 initial_population=initial_population,
                 algorithm=args.algorithm,
                 use_ket_optimization=True,
+                num_workers=args.num_workers,
             )
             # Create animation and save results
             create_sequence_optimization_animation(

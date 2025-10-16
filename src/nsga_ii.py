@@ -5,6 +5,7 @@ import random
 import logging
 import sys
 import signal
+import os
 from typing import Optional
 from pymoo.core.problem import Problem
 from pymoo.algorithms.moo.nsga2 import NSGA2
@@ -34,6 +35,7 @@ from src.sampling import (
     HundredsDiscreteCrossover,
     HundredsDiscreteSampling,
 )
+from src.parallel_evaluation import ParallelEvaluator
 
 logger = setup_logger()
 
@@ -205,6 +207,7 @@ class QuantumOperationSequence(Problem):
         sequence_length=10,
         device_id=0,
         use_ket_optimization=True,
+        num_workers=None,
     ):
         """
         Initialize the quantum operation sequence optimization problem
@@ -216,6 +219,7 @@ class QuantumOperationSequence(Problem):
             sequence_length: Number of operations in sequence
             device_id: ID of GPU device to use
             use_ket_optimization: If True, use ket-based optimization (pure states)
+            num_workers: Number of parallel workers (None = auto-detect as half of CPU cores)
         """
         super().__init__(
             n_var=sequence_length * 3,
@@ -230,6 +234,7 @@ class QuantumOperationSequence(Problem):
         self.device = f"cuda:{device_id}"
         self.use_ket_optimization = use_ket_optimization
         self.initial_probability = initial_probability
+        self.num_workers = num_workers
 
         # Initialize quantum operations
         base_quantum_ops = GPUQuantumOps(self.N)
@@ -299,6 +304,24 @@ class QuantumOperationSequence(Problem):
         logger.info("Operators initialized")
         logger.info("Testing GPU operations...")
         
+        # Initialize parallel evaluator
+        self.parallel_evaluator = ParallelEvaluator(
+            num_workers=self.num_workers,
+            device_id=device_id,
+            use_ket_optimization=use_ket_optimization,
+        )
+        self.parallel_evaluator.start()
+        
+        # Prepare problem data for parallel evaluation
+        self.problem_data = {
+            'initial_state': self.initial_state,
+            'operator': self.op,
+            'projector': self.projector,
+            'sequence_length': self.sequence_length,
+            'N': self.N,
+            'gamma': self.gamma,
+        }
+        
         
     def _damping_operator(self):
         """
@@ -356,7 +379,7 @@ class QuantumOperationSequence(Problem):
 
     def _evaluate(self, x, out, *args, **kwargs):
         """
-        Evaluate the given set of operation sequences.
+        Evaluate the given set of operation sequences using parallel processing.
 
         Parameters
         ----------
@@ -365,6 +388,39 @@ class QuantumOperationSequence(Problem):
             Each operation is represented as a triplet (op_type, param1, param2).
         out : dict
             Dictionary to store the results.
+        """
+        # Use parallel evaluation
+        try:
+            f = self.parallel_evaluator.evaluate_batch(x, self.problem_data)
+        except Exception as e:
+            logger.error(f"Error in parallel evaluation: {e}")
+            # Fallback to sequential evaluation
+            f = self._evaluate_sequential(x)
+        
+        out["F"] = f
+        
+        # Periodic memory cleanup
+        if hasattr(self, '_eval_count'):
+            self._eval_count += 1
+        else:
+            self._eval_count = 1
+        
+        if self._eval_count % 10 == 0:
+            check_memory_and_cleanup(memory_threshold_mb=1200, label=f"EvalBatch{self._eval_count}")
+    
+    def _evaluate_sequential(self, x):
+        """
+        Sequential fallback evaluation (original implementation).
+        
+        Parameters
+        ----------
+        x : array_like
+            2D array of operation sequences
+            
+        Returns
+        -------
+        np.ndarray
+            Objective values
         """
         f = np.zeros((x.shape[0], 2))
 
@@ -460,7 +516,7 @@ class QuantumOperationSequence(Problem):
             if i % 25 == 0:
                 check_memory_and_cleanup(memory_threshold_mb=1200, label=f"Individual{i}")
 
-        out["F"] = f
+        return f
 
     def validate_operation(self, state, op_type, prev_ops):
         """
@@ -1049,6 +1105,7 @@ def run_quantum_sequence_optimization(
     verbose=False,
     custom_crossover=None,
     custom_mutation=None,
+    num_workers=None,
 ):
     """
     Run the quantum operation sequence optimization
@@ -1062,6 +1119,7 @@ def run_quantum_sequence_optimization(
         initial_population: Initial population for the optimization
         algorithm: Optimization algorithm to use
         enable_signal_handler: Whether to enable graceful interrupt handling
+        num_workers: Number of parallel workers (None = auto-detect as half of CPU cores)
 
     Returns:
         Optimization results
@@ -1081,18 +1139,23 @@ def run_quantum_sequence_optimization(
             print("⚠️  Signal handler disabled (not in main thread)")
             enable_signal_handler = False
     
+    # Determine number of workers if not specified
+    if num_workers is None:
+        num_workers = max(1, os.cpu_count() // 2)
+    
     print(f"Starting quantum sequence optimization:")
     print(f"  - Algorithm: {algorithm.upper()}")
     print(f"  - Hilbert space dimension: {N}")
     print(f"  - Sequence length: {sequence_length}")
     print(f"  - Population size: {pop_size}")
     print(f"  - Max generations: {max_generations}")
+    print(f"  - Parallel workers: {num_workers} (using {num_workers}/{os.cpu_count()} CPU cores)")
     if enable_signal_handler:
         print(f"  - Press Ctrl+C once to gracefully stop and save results")
     print()
 
     problem = QuantumOperationSequence(
-        initial_state, initial_probability, operator, N, sequence_length, device_id, use_ket_optimization
+        initial_state, initial_probability, operator, N, sequence_length, device_id, use_ket_optimization, num_workers
     )
 
     # Create trivial solution (do nothing: all identity operations)
@@ -1145,6 +1208,10 @@ def run_quantum_sequence_optimization(
     res = minimize(
         problem, algorithm_obj, termination, seed=42, verbose=verbose, callback=callback
     )
+    
+    # Clean up parallel evaluator
+    if hasattr(problem, 'parallel_evaluator'):
+        problem.parallel_evaluator.stop()
 
     # Check if optimization was interrupted
     if _interrupt_requested:
