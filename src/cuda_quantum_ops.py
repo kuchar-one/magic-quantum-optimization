@@ -36,8 +36,8 @@ class GPUQuantumOps:
         self.device = "cuda:0"  # Default device, will be updated by wrapper
 
         # Print initial CUDA information
-        self.monitor.print_cuda_info()
-        print("\n")
+        #self.monitor.print_cuda_info()
+        #print("\n")
 
         # Pre-compute operators on default device (will be moved by wrapper)
         self.d = self._create_destroy_operator().to(self.device)
@@ -208,6 +208,175 @@ class GPUQuantumOps:
             conditional_dm = conditional_dm / trace_val
 
         return conditional_dm.to(self.device)
+    
+    def beam_splitter_ket(self, one_ket, two_ket, theta: float = np.pi / 4):
+        """
+        Ket-version of beam splitter: returns a two-mode ket (vector length N*N).
+        Accepts inputs as 1-D kets (shape (N,)) or 2-D pure density matrices (shape (N,N))
+        which will be converted to the principal eigenvector if they are (approximately) pure.
+        """
+        one_ket = one_ket.to(self.device)
+        two_ket = two_ket.to(self.device)
+
+        # If density matrices supplied, try to extract principal eigenvector (pure state)
+        def _ensure_ket(x):
+            if x.dim() == 1:
+                return x
+            # x is matrix: attempt to get principal eigenvector
+            vals, vecs = torch.linalg.eigh(x.to(self.device))
+            max_idx = torch.argmax(vals)
+            vec = vecs[:, max_idx]
+            # normalize
+            norm = torch.sqrt(torch.vdot(vec, vec)).real
+            if norm == 0:
+                raise ValueError("Cannot extract ket from zero/invalid density matrix")
+            return (vec / norm).to(self.device)
+
+        ket1 = _ensure_ket(one_ket)
+        ket2 = _ensure_ket(two_ket)
+
+        # Build two-mode unitary U (cached similarly to DM version)
+        d1 = self.tensor_product(self.d, self.identity)
+        d2 = self.tensor_product(self.identity, self.d)
+        op = -theta * (torch.matmul(d1.T.conj(), d2) - torch.matmul(d2.T.conj(), d1))
+
+        cache_dir = os.path.join("cache", "operators")
+        os.makedirs(cache_dir, exist_ok=True)
+        filename = f"beam_splitter_unitary_theta{theta:.4f}_N{self.N}.pt"
+        cache_path = os.path.join(cache_dir, filename)
+
+        # load or compute U
+        if os.path.exists(cache_path):
+            # map to correct device
+            U = torch.load(cache_path, map_location=self.device)
+            U = U.to(self.device)
+        else:
+            try:
+                U = torch.matrix_exp(op).to(self.device)
+                torch.save(U.cpu(), cache_path)
+            except Exception:
+                # fallback series approx
+                U = torch.eye(op.shape[0], dtype=op.dtype, device=self.device)
+                op_power = torch.eye(op.shape[0], dtype=op.dtype, device=self.device)
+                for i in range(1, 10):
+                    op_power = (op_power @ op) / float(i)
+                    U = U + op_power
+                torch.save(U.cpu(), cache_path)
+
+        # form two-mode ket by tensor product (kron)
+        two_mode_ket = torch.kron(ket1, ket2).to(self.device)  # shape (N*N,)
+        # apply unitary: U @ ket
+        out_ket = U @ two_mode_ket
+        return out_ket.to(self.device)
+
+    def measure_mode_ket(self, two_mode_ket, projector, mode: int):
+        """
+        Measure one mode of a two-mode ket using a projector (ket-version).
+        If projector is rank-1, return the (normalized) postselected ket for the other mode.
+        If projector is not rank-1, fallback to density-mode measurement and extract principal eigenvector.
+        mode: 1 or 2, which mode the projector acts on (1 = first mode).
+        """
+        two_mode_ket = two_mode_ket.to(self.device)
+        projector = projector.to(self.device)
+
+        # ensure two-mode ket shape
+        if two_mode_ket.dim() != 1 or two_mode_ket.numel() != self.N * self.N:
+            raise ValueError("two_mode_ket must be a 1-D ket of length N*N for ket measurement")
+
+        psi = two_mode_ket.view(self.N, self.N)  # psi[i,j] corresponds to |i> (mode1) ⊗ |j> (mode2)
+
+        # helper to try to extract rank-1 projector vector
+        def _projector_vector(P):
+            # If given a vector / ket
+            if P.dim() == 1:
+                return P.to(self.device)
+            # symmetric/hermitian projector expected -> eigen decomposition
+            try:
+                vals, vecs = torch.linalg.eigh(P.to(self.device))
+            except Exception:
+                return None
+            max_idx = torch.argmax(vals)
+            max_val = vals[max_idx].real
+            # check if projector is approximately rank-1 (largest eigenvalue close to 1)
+            if max_val > 1e-6:
+                v = vecs[:, max_idx]
+                return v.to(self.device)
+            return None
+
+        v = _projector_vector(projector)
+        if v is not None:
+            # compute postselected ket of the other mode
+            if mode == 1:
+                # measure first mode onto |v><v|: resulting (unnormalized) ket for mode2 is <v| ⊗ I |Psi>
+                # i.e. v^H @ psi  -> shape (N,) (row vector)
+                v_conj = torch.conj(v)
+                out = v_conj.unsqueeze(0) @ psi  # shape (1, N)
+                out = out.squeeze(0)
+            elif mode == 2:
+                # measure second mode onto |v><v|: resulting ket for mode1 is I ⊗ <v| |Psi>
+                v_conj = torch.conj(v)
+                out = psi @ v_conj.unsqueeze(1)  # shape (N,1)
+                out = out.squeeze(1)
+            else:
+                raise ValueError("mode must be 1 or 2")
+
+            # normalize
+            norm = torch.sqrt(torch.real(torch.vdot(out, out)))
+            if norm == 0 or not torch.isfinite(norm):
+                # measurement resulted in zero amplitude
+                return torch.zeros(self.N, dtype=out.dtype, device=self.device)
+            return (out / norm).to(self.device)
+
+        # If projector isn't rank-1 (or vector extraction failed), fallback to density-mode measurement
+        # Build density matrix from ket and call measure_mode which returns density for remaining mode
+        rho = torch.outer(two_mode_ket, torch.conj(two_mode_ket)).to(self.device)
+        rho_after = self.measure_mode(rho, projector, mode)  # returns density matrix of remaining mode
+
+        # Try to extract principal eigenvector (if result is near-pure)
+        try:
+            vals, vecs = torch.linalg.eigh(rho_after.to(self.device))
+            max_idx = torch.argmax(vals)
+            vec = vecs[:, max_idx]
+            norm = torch.sqrt(torch.real(torch.vdot(vec, vec)))
+            if norm == 0 or not torch.isfinite(norm):
+                return torch.zeros(self.N, dtype=vec.dtype, device=self.device)
+            return (vec / norm).to(self.device)
+        except Exception:
+            # Give up and return zero ket if extraction fails
+            return torch.zeros(self.N, dtype=rho_after.dtype, device=self.device)
+
+    def breeding_ket(self, rounds: int, input_ket, projector):
+        """
+        Ket-version of the breeding protocol. Recursive:
+          - beam_splitter_ket(input_ket, input_ket)
+          - measure_mode_ket(temp, projector, 1)
+          - recurse rounds-1 on the resulting single-mode ket
+
+        Returns a single-mode ket (normalized) after `rounds` of breeding.
+        """
+        input_ket = input_ket.to(self.device)
+        projector = projector.to(self.device)
+
+        # If input provided as density (matrix), try to extract ket
+        if input_ket.dim() == 2:
+            # attempt principal eigenvector
+            vals, vecs = torch.linalg.eigh(input_ket.to(self.device))
+            max_idx = torch.argmax(vals)
+            vec = vecs[:, max_idx]
+            norm = torch.sqrt(torch.real(torch.vdot(vec, vec)))
+            if norm == 0:
+                raise ValueError("Cannot extract ket from input density for breeding_ket")
+            input_ket = (vec / norm).to(self.device)
+
+        if rounds == 0:
+            return input_ket.to(self.device)
+
+        # produce two-mode ket (both inputs are identical)
+        temp = self.beam_splitter_ket(input_ket, input_ket)
+        new_ket = self.measure_mode_ket(temp, projector, 1)  # measure first mode, get ket of second
+        # Recurse
+        return self.breeding_ket(rounds - 1, new_ket, projector)
+
 
     def get_free_memory(self):
         """

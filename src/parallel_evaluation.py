@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 
-SAME_OP_PENALTY = 0.5  # Penalty factor for repeating the same operation type
+SAME_OP_PENALTY = 0.1  # Penalty factor for repeating the same operation type
 
 
 class ParallelEvaluator:
@@ -341,7 +341,7 @@ def _evaluate_single_individual(
                 break
 
             if not np.isfinite(norm_val) or norm_val == 0.0:
-                print(f"Invalid norm ({norm_val}) after op idx {op_idx}, op_type {op_type}", file=sys.stderr)
+                #print(f"Invalid norm ({norm_val}) after op idx {op_idx}, op_type {op_type}", file=sys.stderr)
                 total_probability = 0.0
                 break
 
@@ -369,7 +369,8 @@ def _evaluate_single_individual(
 
     # Sequence probability
     if total_probability != 0.0:
-        total_probability = _calculate_sequence_probability_recursive(ops, initial_prob=1.0)
+        reversed_ops = list(reversed(ops))
+        total_probability = _calculate_sequence_probability_recursive(reversed_ops, initial_prob=1.0)
 
     # Operator expectation
     if total_probability != 0.0:
@@ -547,8 +548,8 @@ def _apply_breeding(
     """Apply breeding operation. For kets this may be simplified."""
     try:
         if use_ket_optimization and state.dim() == 1:
-            # simplified no-op or custom ket-breeding code
-            return state
+            #print("_apply_breeding: using breeding_ket", file=sys.stderr)
+            return quantum_ops.breeding_ket(rounds, state, projector)
         else:
             if hasattr(quantum_ops, "breeding_gpu"):
                 return quantum_ops.breeding_gpu(rounds, state, projector)
