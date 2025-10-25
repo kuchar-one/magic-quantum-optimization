@@ -238,10 +238,7 @@ class QuantumOperationSequence(Problem):
 
         # Initialize quantum operations
         base_quantum_ops = GPUQuantumOps(self.N)
-        extended_N = np.round(self.N * 1.5).astype(int)
-        helper_quantum_ops = GPUQuantumOps(extended_N)
         self.quantum_ops = GPUDeviceWrapper(base_quantum_ops, device_id)
-        self.helper_ops = GPUDeviceWrapper(helper_quantum_ops, device_id)
 
         if operator is None:
             operator = gkp_operator_new(N)
@@ -249,6 +246,7 @@ class QuantumOperationSequence(Problem):
 
         groundstate_eigval_qutip = operator.groundstate()[0]
         logger.info(f"Operator groundstate eigenvalue: {groundstate_eigval_qutip}")
+        print(f"Operator groundstate eigenvalue (qutip): {groundstate_eigval_qutip}")
 
         print(f"Operator type: {type(operator)}")
         print(f"Operator has .full() method: {hasattr(operator, 'full')}")
@@ -258,6 +256,7 @@ class QuantumOperationSequence(Problem):
         logger.info(
             f"Operator torch groundstate eigenvalue: {self.groundstate_eigenvalue}"
         )
+        print(f"Operator torch groundstate eigenvalue: {self.groundstate_eigenvalue}")
 
         try:
             projector_qobj = p0_projector(N)
@@ -273,10 +272,7 @@ class QuantumOperationSequence(Problem):
         self._current_eval_idx = None
         self.previous_op_changed = False
 
-        try:
-            # Initialize gamma for operation probability calculation
-            self.gamma = 0.1
-            
+        try:            
             if use_ket_optimization:
                 # Ket-based optimization: work with pure states
                 self.initial_state = torch.tensor(
@@ -284,17 +280,16 @@ class QuantumOperationSequence(Problem):
                 ).squeeze().to(self.device)
                 self.initial_state = self.initial_state / torch.norm(self.initial_state)
                 logger.info("Using ket-based optimization (pure states)")
+                print(f"Initial KET norm: {torch.norm(self.initial_state)}")
             else:
                 # Density matrix optimization: convert to density matrix
                 self.initial_state = torch.tensor(
                     qt.ket2dm(initial_state).full(), dtype=torch.complex64
                 ).to(self.device)
-                self.initial_state = self.initial_state / torch.norm(self.initial_state)
+                self.initial_state = self.initial_state / torch.trace(self.initial_state)
                 # Initialize Kraus operators for mixed state operations
-                self.damping_operator = self._damping_operator()
-                self.subtraction_kraus = torch.sqrt(torch.exp(torch.tensor(2*self.gamma)) - 1.0) * (self.damping_operator @ self.quantum_ops.d)
-                self.addition_kraus = torch.sqrt(torch.exp(torch.tensor(2*self.gamma)) - 1.0) * (self.damping_operator @ self.quantum_ops.d.T.conj())
                 logger.info("Using density matrix optimization (mixed states)")
+                print(f"Initial DM trace: {torch.trace(self.initial_state)}")
         except Exception as e:
             print(f"Error with initial state: {e}")
             import traceback
@@ -318,65 +313,9 @@ class QuantumOperationSequence(Problem):
             'operator': self.op,
             'projector': self.projector,
             'sequence_length': self.sequence_length,
-            'N': self.N,
-            'gamma': self.gamma,
+            'N': self.N
         }
         
-        
-    def _damping_operator(self):
-        """
-        Returns the diagonal 'damping' operator E = e^{-γ a†a}.
-        """
-        a = self.quantum_ops.d
-        adag = a.T.conj()
-        n_op = adag @ a
-        return torch.linalg.matrix_exp(-self.gamma * n_op)
-
-    def sequence_probability(self, operations, total_probability=None):
-        """
-        Calculate the total probability of a sequence of quantum operations.
-
-        This function iterates over a list of operations, where each operation is
-        represented as a tuple containing the operation type and its probability.
-        It calculates the cumulative probability of the sequence by multiplying
-        the probabilities of individual operations, applying a decay factor of 0.99
-        for non-zero operations, and handling special cases such as breeding
-        operations (op type 3) which have recursive probability contributions.
-
-        Parameters
-        ----------
-        operations : list of tuple
-            A list of tuples where each tuple consists of an operation type (int)
-            and its probability (float).
-        total_probability : float, optional
-            Initial probability to start the calculation with. Default is 1.
-
-        Returns
-        -------
-        float
-            The total probability of the given operation sequence.
-        """
-        if total_probability == None:
-            total_probability = 1
-        elif len(operations) == 0:
-            total_probability *= self.initial_probability
-            return total_probability
-
-        for index, (op, probability) in enumerate(operations):
-            total_probability *= probability
-            if op != 0:
-                total_probability *= 0.99
-            if op == 3:
-                total_probability *= (
-                    self.sequence_probability(
-                        operations[index + 1 :], total_probability
-                    )
-                    ** 2
-                )
-                return total_probability
-        total_probability *= self.initial_probability
-        return total_probability
-
     def _evaluate(self, x, out, *args, **kwargs):
         """
         Evaluate the given set of operation sequences using parallel processing.
@@ -394,8 +333,7 @@ class QuantumOperationSequence(Problem):
             f = self.parallel_evaluator.evaluate_batch(x, self.problem_data)
         except Exception as e:
             logger.error(f"Error in parallel evaluation: {e}")
-            # Fallback to sequential evaluation
-            f = self._evaluate_sequential(x)
+            print(f"Error in parallel evaluation: {e}")
         
         out["F"] = f
         
@@ -405,7 +343,7 @@ class QuantumOperationSequence(Problem):
         else:
             self._eval_count = 1
         
-        if self._eval_count % 10 == 0:
+        if self._eval_count % 100 == 0:
             check_memory_and_cleanup(memory_threshold_mb=1200, label=f"EvalBatch{self._eval_count}")
             
 class OptimizationCallback(Callback):
